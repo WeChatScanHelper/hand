@@ -1,90 +1,81 @@
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
 import cv2
 import mediapipe as mp
-import math
-from spellchecker import SpellChecker
 
-# Initialize Tools
-spell = SpellChecker()
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
-hands = mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.7)
+# Explicitly import the solutions to avoid the AttributeError
+import mediapipe.python.solutions.hands as mp_hands
+import mediapipe.python.solutions.drawing_utils as mp_drawing
 
-def get_dist(p1, p2):
-    return math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2)
+# Initialize MediaPipe Hands
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7
+)
 
-if 'sentence' not in st.session_state:
-    st.session_state.sentence = []
-
-class SignLanguageProcessor(VideoProcessorBase):
+class ASLProcessor(VideoProcessorBase):
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
-        img = cv2.flip(img, 1)
+        img = cv2.flip(img, 1)  # Flip for selfie view
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         results = hands.process(img_rgb)
-        label = ""
+        
+        label = "No hand detected"
 
         if results.multi_hand_landmarks:
             for hand_landmarks in results.multi_hand_landmarks:
                 mp_drawing.draw_landmarks(img, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                
+                # Get landmarks
                 lm = hand_landmarks.landmark
+                
+                # Logic to determine finger states (Open/Closed)
+                # Tips: Thumb(4), Index(8), Middle(12), Ring(16), Pinky(20)
+                index_open = lm[8].y < lm[6].y
+                middle_open = lm[12].y < lm[10].y
+                ring_open = lm[16].y < lm[14].y
+                pinky_open = lm[20].y < lm[18].y
+                
+                # Thumb Logic (Calculated by horizontal distance for side-thumb signs)
+                thumb_open = lm[4].x < lm[3].x 
 
-                # Finger states [Thumb, Index, Middle, Ring, Pinky]
-                fingers = []
-                fingers.append(1 if lm[4].x > lm[3].x else 0) # Thumb
-                for tip, pip in zip([8, 12, 16, 20], [6, 10, 14, 18]):
-                    fingers.append(1 if lm[tip].y < lm[pip].y else 0)
+                # --- ASL Logic Mapping (Based on your chart) ---
+                if index_open and middle_open and ring_open and pinky_open:
+                    label = "Letter: B"
+                elif index_open and not middle_open and not ring_open and not pinky_open:
+                    # L has thumb out, D has thumb tucked
+                    if lm[4].x < lm[3].x: label = "Letter: L"
+                    else: label = "Letter: D"
+                elif index_open and middle_open and not ring_open and not pinky_open:
+                    label = "Letter: V"
+                elif not index_open and not middle_open and not ring_open and pinky_open:
+                    label = "Letter: I"
+                elif thumb_open and pinky_open and not index_open and not middle_open:
+                    label = "Letter: Y"
+                elif not index_open and not middle_open and not ring_open and not pinky_open:
+                    label = "Letter: A / S" # Fist signs
+                else:
+                    label = "Searching..."
 
-                # Advanced Logic Mapping
-                if fingers == [0, 1, 1, 1, 1]: label = "B"
-                elif fingers == [0, 1, 0, 0, 0]: label = "D"
-                elif fingers == [0, 0, 0, 0, 1]: label = "I"
-                elif fingers == [1, 1, 0, 0, 0]: label = "L"
-                elif fingers == [1, 0, 0, 0, 1]: label = "Y"
-                elif fingers == [0, 1, 1, 0, 0]: label = "V"
-                elif fingers == [0, 1, 1, 1, 0]: label = "W"
-                elif fingers == [0, 0, 0, 0, 0]: # Fist variants
-                    d_idx = get_dist(lm[4], lm[7])
-                    d_mid = get_dist(lm[4], lm[11])
-                    if d_idx < 0.04: label = "T"
-                    elif d_mid < 0.04: label = "N"
-                    else: label = "A"
-                else: label = "Looking..."
-
-        cv2.putText(img, label, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3)
+        # Overlay text on the video
+        cv2.putText(img, label, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         return img
 
-# --- STREAMLIT UI ---
-st.set_page_config(page_title="ASL AI Translator", layout="wide")
-st.title("🤟 ASL Translator + Autocorrect")
+# Streamlit UI
+st.set_page_config(page_title="ASL Translator", layout="centered")
+st.title("🤟 ASL Real-Time Translator")
+st.write("Using MediaPipe for hand tracking and your provided ASL chart.")
 
-col1, col2 = st.columns([2, 1])
+# WebRTC configuration for Render (Stun servers help bypass firewalls)
+RTC_CONFIG = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
 
-with col1:
-    webrtc_streamer(key="asl-full", video_processor_factory=SignLanguageProcessor)
-
-with col2:
-    st.write("### Controls")
-    current_char = st.text_input("Detected Letter (Manual Edit)", value="")
-    
-    if st.button("Add Letter to Word"):
-        st.session_state.sentence.append(current_char.upper())
-    
-    full_word = "".join(st.session_state.sentence)
-    st.write(f"**Current Spelling:** `{full_word}`")
-    
-    if full_word:
-        corrected = spell.correction(full_word)
-        if corrected and corrected.upper() != full_word:
-            st.success(f"Did you mean: **{corrected.upper()}**?")
-            if st.button("Use Correction"):
-                st.session_state.sentence = list(corrected.upper())
-                st.rerun()
-
-    if st.button("Clear All"):
-        st.session_state.sentence = []
-        st.rerun()
-
-st.divider()
-st.info("How to use: Sign a letter, type it into the box, and click 'Add'. The AI will suggest the correct word if you make a mistake!")
+webrtc_streamer(
+    key="asl-translate",
+    video_processor_factory=ASLProcessor,
+    rtc_configuration=RTC_CONFIG,
+    media_stream_constraints={"video": True, "audio": False},
+)
